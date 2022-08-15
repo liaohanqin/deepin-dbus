@@ -1,0 +1,6 @@
+#!/usr/bin/dh-exec
+
+usr/lib/dbus-1.0/dbus-daemon-launch-helper
+
+[linux-any] lib/systemd/system/dbus.service
+[linux-any] lib/systemd/system/multi-user.target.wants/dbus.service
