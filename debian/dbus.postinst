@@ -63,26 +63,11 @@ fi
 
 #DEBHELPER#
 
-# We start the dbus-daemon ourselves rather than letting debhelper take
-# responsibility.
-#
-# This is to stop debhelper from ever restarting the dbus-daemon,
-# which versions since 13.4 cannot be prevented from doing, except with
-# --no-stop: https://bugs.debian.org/994204
-if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ] ; then
-    if [ -z "${DPKG_ROOT:-}" ]; then
-        if [ -d /run/systemd/system ]; then
-            systemctl --system daemon-reload >/dev/null || true
-            deb-systemd-invoke start 'dbus.service' 'dbus.socket' >/dev/null || true
-        elif [ -x "/etc/init.d/dbus" ]; then
-            invoke-rc.d --skip-systemd-native dbus start
-        fi
-
-        # We only need to do this for upgrades, not new installations.
-        if [ "$1" = configure ] && [ -n "$2" ]; then
-            reload_dbus_config
-        fi
-    fi
+# Do this after the debhelper-generated bits so that dpkg-maintscript-helper
+# will have finished moving configuration files around. We only need to do
+# this for upgrades, not new installations.
+if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = configure ] && [ -n "$2" ]; then
+    reload_dbus_config
 fi
 
 # vim:set sw=4 sts=4 et:

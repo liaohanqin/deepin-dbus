@@ -16,16 +16,15 @@ libdbus_soname := $(patsubst libdbus-1-%,libdbus-1.so.%,$(libdbusN))
 debug_build_prefix := /usr/lib/dbus-1.0/debug-build
 binaries := $(shell dh_listpackages)
 
-export DEB_LDFLAGS_MAINT_APPEND = \
-	-Wl,--as-needed \
-	-Wl,--gc-sections \
-	$(NULL)
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,--gc-sections
 
 dh_options = \
 	--builddirectory=debian/build-main \
+	--with xml-core \
 	$(NULL)
 
 common_configure_flags := \
+		--enable-traditional-activation \
 		--libexecdir=\$${prefix}/lib/dbus-1.0 \
 		--with-system-socket=/run/dbus/system_bus_socket \
 		$(NULL)
@@ -41,7 +40,7 @@ common_configure_flags += \
 		--enable-libaudit \
 		--enable-selinux \
 		--enable-systemd \
-		--with-systemdsystemunitdir=/lib/systemd/system \
+		--with-systemdsystemunitdir=/usr/lib/systemd/system \
 		--with-session-socket-dir=/tmp \
 		--with-test-socket-dir=/tmp \
 		SYSTEMCTL=/bin/systemctl \
@@ -196,7 +195,6 @@ ifneq ($(filter dbus-tests,$(binaries)),)
 	# debug build
 	make -C debian/build-debug install DESTDIR=$(CURDIR)/debian/tmp
 	rm -rfv debian/tmp/etc
-	rm -rfv debian/tmp/lib/systemd
 	rm -rfv debian/tmp/usr/include
 	rm -rfv debian/tmp/usr/lib/systemd
 	rm -rfv debian/tmp/usr/lib/sysusers.d
@@ -255,19 +253,14 @@ endif
 override_dh_missing:
 	dh_missing $(dh_missing_options)
 
-# Since debhelper 13.4, there's no way to avoid restarting after upgrade,
-# other than this. Just let debhelper handle update-rc.d, and don't stop,
-# start or restart the service; we'll start it ourselves.
+# Yes, we do need both --no- options here. https://bugs.debian.org/837528
 override_dh_installinit:
-	dh_installinit -pdbus --no-start
+	dh_installinit -pdbus --no-stop-on-upgrade --no-restart-after-upgrade
 override_dh_installsystemd:
-	dh_installsystemd -pdbus --no-restart-after-upgrade --no-start
+	dh_installsystemd -pdbus --no-stop-on-upgrade --no-restart-after-upgrade
 
 override_dh_installdocs:
 	dh_installdocs --all AUTHORS NEWS README
-
-override_dh_strip:
-	dh_strip --dbgsym-migration='dbus-1-dbg (<< 1.11.10-2~)'
 
 debian/$(libdbusN).symbols: debian/$(libdbusN).symbols.in
 	sed -e 's/$${DEB_VERSION}/${DEB_VERSION}/g' \

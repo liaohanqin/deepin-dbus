@@ -25,6 +25,15 @@ Tests: dbus-daemon
 Restrictions: allow-stderr, superficial
 Depends: dbus-daemon
 
+Tests: machine-id
+Restrictions: allow-stderr, needs-root, superficial
+Depends: dbus-daemon
+
+Test-Command: debian/tests/machine-id with-systemd
+Features: test-name=machine-id_with_systemd
+Restrictions: allow-stderr, needs-root, superficial
+Depends: dbus-daemon, systemd
+
 Tests: dbus-session-bus-common
 Restrictions: allow-stderr, superficial
 Depends: dbus-session-bus-common

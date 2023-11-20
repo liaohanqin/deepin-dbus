@@ -2,22 +2,11 @@
 
 set -e
 
-# We stop the dbus-daemon ourselves rather than letting debhelper take
-# responsibility.
-#
-# This is partly because older debhelper didn't know that it needs to stop
-# dbus.socket before dbus.service: https://bugs.debian.org/813970
-#
-# It's also partly to stop debhelper from ever restarting the dbus-daemon,
-# which versions since 13.4 cannot be prevented from doing, except with
-# --no-stop: https://bugs.debian.org/994204
-
-if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = remove ]; then
-    if [ -d /run/systemd/system ]; then
-        deb-systemd-invoke stop 'dbus.service' 'dbus.socket' >/dev/null || true
-    elif [ -x "/etc/init.d/dbus" ]; then
-        invoke-rc.d --skip-systemd-native dbus stop || exit 1
-    fi
+if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ] && [ "$1" = remove ]; then
+	# Before stopping dbus-daemon, ensure that it won't just be
+	# reactivated by dbus.socket. The "invoke-rc.d dbus stop"
+	# added by debhelper, below, will harmlessly not do anything.
+	deb-systemd-invoke stop dbus.socket dbus.service || exit $?
 fi
 
 #DEBHELPER#

@@ -1,16 +1,17 @@
 Source: dbus
 Section: admin
 Priority: optional
-Maintainer: Deepin Developer <deepin-dev@deepin.org>
-Uploaders: Deepin Packages Builder <packages@deepin.org>
+Maintainer: Utopia Maintenance Team <pkg-utopia-maintainers@lists.alioth.debian.org>
+Uploaders:
  Sjoerd Simons <sjoerd@debian.org>,
  Sebastian Dröge <slomo@debian.org>,
  Michael Biebl <biebl@debian.org>,
  Loic Minier <lool@dooz.org>,
  Simon McVittie <smcv@debian.org>,
 Build-Depends:
- autoconf-archive (>= 20150224),
+ autoconf-archive,
  automake,
+ debhelper (>= 13.11.6~),
  debhelper-compat (= 13),
  dh-exec,
  libapparmor-dev [linux-any],
@@ -22,20 +23,18 @@ Build-Depends:
  libselinux1-dev [linux-any],
  libsystemd-dev [linux-any],
  libx11-dev,
- pkg-config,
- python3 <!nocheck> <!noinsttest>,
- python3-dbus <!nocheck> <!noinsttest>,
- python3-gi <!nocheck> <!noinsttest>,
- valgrind [amd64 arm64 armhf i386 mips64 mips64el mips mipsel powerpc ppc64 ppc64el s390x],
+ pkgconf,
+ valgrind-if-available,
+ xml-core,
  xmlto <!nodoc>,
 Build-Depends-Indep:
  doxygen <!nodoc>,
  ducktype <!nodoc>,
  xsltproc <!nodoc>,
  yelp-tools <!nodoc>,
-Standards-Version: 4.6.0
-#Vcs-Git
-#Vcs-Browser
+Standards-Version: 4.6.2
+Vcs-Git: https://salsa.debian.org/utopia-team/dbus.git
+Vcs-Browser: https://salsa.debian.org/utopia-team/dbus
 Homepage: https://dbus.freedesktop.org/
 Rules-Requires-Root: no
 
@@ -46,12 +45,12 @@ Provides:
  dbus-system-bus (= ${binary:Version}),
  default-dbus-system-bus,
 Pre-Depends:
- init-system-helpers (>= 1.54~),
  ${misc:Pre-Depends},
 Depends:
  dbus-bin (= ${binary:Version}),
  dbus-daemon (= ${binary:Version}),
  dbus-system-bus-common (>= ${source:Version}),
+ usr-is-merged (>= 38~),
  ${misc:Depends},
  ${shlibs:Depends},
 Suggests:
@@ -81,12 +80,13 @@ Description: simple interprocess messaging system (system message bus)
 
 Package: dbus-session-bus-common
 Architecture: all
+Multi-Arch: foreign
 Depends:
  ${misc:Depends},
 Breaks:
- dbus (<< 1.12.20-3~),
+ dbus (<< 1.13.18-2~),
 Replaces:
- dbus (<< 1.12.20-3~),
+ dbus (<< 1.13.18-2~),
 Description: simple interprocess messaging system (session bus configuration)
  D-Bus is a message bus, used for sending messages between applications.
  Conceptually, it fits somewhere in between raw sockets and CORBA in
@@ -104,13 +104,14 @@ Description: simple interprocess messaging system (session bus configuration)
 
 Package: dbus-system-bus-common
 Architecture: all
+Multi-Arch: foreign
 Depends:
  adduser,
  ${misc:Depends},
 Breaks:
- dbus (<< 1.12.20-3~),
+ dbus (<< 1.13.18-2~),
 Replaces:
- dbus (<< 1.12.20-3~),
+ dbus (<< 1.13.18-2~),
 Description: simple interprocess messaging system (system bus configuration)
  D-Bus is a message bus, used for sending messages between applications.
  Conceptually, it fits somewhere in between raw sockets and CORBA in
@@ -130,13 +131,14 @@ Description: simple interprocess messaging system (system bus configuration)
 
 Package: dbus-bin
 Architecture: any
+Multi-Arch: foreign
 Depends:
  ${misc:Depends},
  ${shlibs:Depends},
 Breaks:
- dbus (<< 1.12.20-3~),
+ dbus (<< 1.13.18-2~),
 Replaces:
- dbus (<< 1.12.20-3~),
+ dbus (<< 1.13.18-2~),
 Description: simple interprocess messaging system (command line utilities)
  D-Bus is a message bus, used for sending messages between applications.
  Conceptually, it fits somewhere in between raw sockets and CORBA in
@@ -147,15 +149,16 @@ Description: simple interprocess messaging system (command line utilities)
 
 Package: dbus-daemon
 Architecture: any
+Multi-Arch: foreign
 Depends:
  dbus-bin (= ${binary:Version}),
  dbus-session-bus-common (>= ${source:Version}),
  ${misc:Depends},
  ${shlibs:Depends},
 Breaks:
- dbus (<< 1.12.20-3~),
+ dbus (<< 1.13.18-2~),
 Replaces:
- dbus (<< 1.12.20-3~),
+ dbus (<< 1.13.18-2~),
 Description: simple interprocess messaging system (reference message bus)
  D-Bus is a message bus, used for sending messages between applications.
  Conceptually, it fits somewhere in between raw sockets and CORBA in
@@ -251,10 +254,6 @@ Depends:
  ${misc:Depends},
 Recommends:
  systemd-sysv,
-Breaks:
- dbus-x11 (<< 1.9.10-2~),
- policykit-1 (<< 0.105-12~),
- udisks2 (<< 2.1.5-2~),
 Description: simple interprocess messaging system (systemd --user integration)
  D-Bus is a message bus, used for sending messages between applications.
  Conceptually, it fits somewhere in between raw sockets and CORBA in
@@ -313,8 +312,6 @@ Pre-Depends:
 Depends:
  ${misc:Depends},
  ${shlibs:Depends},
-Breaks:
- dbus (<< 1.9.16-1~),
 Recommends:
  dbus,
 Section: libs
@@ -357,7 +354,7 @@ Pre-Depends:
  ${misc:Pre-Depends},
 Depends:
  libdbus-1-3 (= ${binary:Version}),
- pkg-config,
+ pkgconf,
  ${misc:Depends},
  ${shlibs:Depends},
 Description: simple interprocess messaging system (development headers)
