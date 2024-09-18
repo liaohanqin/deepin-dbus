@@ -1,0 +1,878 @@
+From 60af43f298a54aa9cf96c014ac01e4787a5e9ca5 Mon Sep 17 00:00:00 2001
+From: zhangya <zhangya@uniontech.com>
+Date: Tue, 24 Sep 2024 16:47:35 +0800
+Subject: [PATCH] feat: security: usec: usec-ac d-bus control.
+
+---
+ bus/Makefile.am      |   3 +
+ bus/bus.c            |  30 +++
+ bus/deepin_usec_ac.c | 448 +++++++++++++++++++++++++++++++++++++++++++
+ bus/deepin_usec_ac.h |  61 ++++++
+ bus/main.c           |  10 +
+ bus/signals.c        | 163 ++++++++++++++++
+ bus/signals.h        |  22 +++
+ 7 files changed, 737 insertions(+)
+ create mode 100644 bus/deepin_usec_ac.c
+ create mode 100644 bus/deepin_usec_ac.h
+
+diff --git a/bus/Makefile.am b/bus/Makefile.am
+index 1595432..62a433d 100644
+--- a/bus/Makefile.am
++++ b/bus/Makefile.am
+@@ -13,6 +13,7 @@ DBUS_BUS_LIBS = \
+ 	$(THREAD_LIBS) \
+ 	$(ADT_LIBS) \
+ 	$(NETWORK_libs) \
++	-ldl \
+ 	$(NULL)
+ 
+ DBUS_LAUNCHER_LIBS = \
+@@ -121,6 +122,8 @@ libdbus_daemon_internal_la_SOURCES =		\
+ 	policy.h				\
+ 	selinux.h				\
+ 	selinux.c				\
++	deepin_usec_ac.h 		\
++	deepin_usec_ac.c		\
+ 	services.c				\
+ 	services.h				\
+ 	signals.c				\
+diff --git a/bus/bus.c b/bus/bus.c
+index 11de90d..2ec125b 100644
+--- a/bus/bus.c
++++ b/bus/bus.c
+@@ -38,6 +38,7 @@
+ #include "signals.h"
+ #include "selinux.h"
+ #include "apparmor.h"
++#include "deepin_usec_ac.h"
+ #include "audit.h"
+ #include "dir-watch.h"
+ #include <dbus/dbus-auth.h>
+@@ -1830,6 +1831,35 @@ bus_context_check_security_policy (BusContext     *context,
+                                      error))
+         return FALSE;
+ 
++      // deepin ext check
++      if (!deepin_usec_ac_allows_send(context, sender, proposed_recipient, addressed_recipient,
++                               requested_reply,
++                               bus_context_get_type(context),
++                               message,
++                               dbus_message_get_type(message),
++                               dbus_message_get_path(message),
++                               dbus_message_get_interface(message),
++                               dbus_message_get_member(message),
++                               dbus_message_get_error_name(message),
++                               dest ? dest : DBUS_SERVICE_DBUS,
++                               src ? src : DBUS_SERVICE_DBUS,
++                               activation_entry,
++                               error))
++      {
++        if (error != NULL && !dbus_error_is_set (error))
++        {
++            /* don't syslog this, just set the error: avc_has_perm should
++            * have already written to either the audit log or syslog */
++            complain_about_message(context, DBUS_ERROR_ACCESS_DENIED,
++                            "deepin usec ac security deny this message",
++                            1,
++                            message, sender, proposed_recipient, requested_reply,
++                            (addressed_recipient == proposed_recipient), error);
++            _dbus_verbose("deepin usec ac security denying this message\n");
++        }
++        return FALSE;
++      }
++
+       if (!bus_connection_is_active (sender))
+         {
+           /* Policy for inactive connections is that they can only send
+diff --git a/bus/deepin_usec_ac.c b/bus/deepin_usec_ac.c
+new file mode 100644
+index 0000000..f44ed9b
+--- /dev/null
++++ b/bus/deepin_usec_ac.c
+@@ -0,0 +1,448 @@
++#include <unistd.h>
++#include <stdlib.h>
++#include "config.h"
++#include "signals.h"
++#include "utils.h"
++#include <dlfcn.h>
++#include "audit.h"
++#include <syslog.h>
++#include <dbus/dbus-string.h>
++
++#ifdef HAVE_LIBAUDIT
++#include <libaudit.h>
++#endif /* HAVE_LIBAUDIT */
++
++#include <dbus/dbus-internals.h>
++#include <dbus/dbus-string.h>
++
++#include "deepin_usec_ac.h"
++
++#define USEC_AC_LIB_MAJOR_VERSION   0
++#define USEC_AC_LIB_MINOR_VERSION   1
++#define USEC_AC_LIB_MICRO_VERSION   0
++
++static BusMatchmaker *matchmaker = NULL;
++static void* pluginHandler = NULL;
++
++static void (*UsecAcGetLibVersion)(int *major_version_p, int *minor_version_p, int *micro_version_p) = NULL;
++static int (*UsecAcDbusInitCache)(const char* bus_type) = NULL;
++static uint16_t (*UsecAcDbusGetRuleSize)(void) = NULL;
++static uint16_t (*UsecAcDbusGetRuleMemberSize)(uint16_t entity_id) = NULL;
++static const char* (*UsecAcDbusGetRule)(uint16_t entity_id, uint16_t member_id) = NULL;
++static int (*UsecAcDBusCheckAuth)(const UsecAcDBusMessage* msg, char** error_info);
++
++dbus_bool_t deepin_usec_ac_reload(BusContext *context)
++{
++    _dbus_verbose("deepin_usec_ac_reload\n");
++    deepin_usec_ac_shutdown();
++    return deepin_usec_ac_init(context);
++}
++
++static void close_usecac_function(void) {
++    if(pluginHandler){
++        dlclose(pluginHandler);
++        pluginHandler = NULL;
++    }
++
++    UsecAcGetLibVersion = NULL;
++    UsecAcDbusInitCache = NULL;
++    UsecAcDbusGetRuleSize = NULL;
++    UsecAcDbusGetRuleMemberSize = NULL;
++    UsecAcDbusGetRule = NULL;
++    UsecAcDBusCheckAuth = NULL;
++}
++
++static dbus_bool_t init_usecac_function(void) {
++    if(pluginHandler) {
++        return TRUE;
++    }
++
++	pluginHandler = dlopen("/lib/libusec-ac.so", RTLD_LAZY | RTLD_GLOBAL);
++	if (pluginHandler == NULL)
++	{
++		_dbus_verbose("load plugin so failed: dlopen %s", dlerror());
++		close_usecac_function();
++		return FALSE;
++	}
++
++	UsecAcGetLibVersion = (void (*)(int*, int*, int*))dlsym(
++		pluginHandler, "UsecAcGetLibVersion");
++	if (UsecAcGetLibVersion == NULL)
++	{
++		_dbus_verbose("load plugin so failed: dlsym UsecAcGetLibVersion %s", dlerror());
++		close_usecac_function();
++		return FALSE;
++	}
++
++
++    UsecAcDbusInitCache = (int (*)(const char*))dlsym(
++		pluginHandler, "UsecAcDbusInitCache");
++    if (pluginHandler == NULL)
++	{
++		_dbus_verbose("load plugin so failed: dlsym UsecAcDbusInitCache %s", dlerror());
++        close_usecac_function();
++		return FALSE;
++	}
++
++
++	UsecAcDbusGetRuleSize = (uint16_t (*)(void))dlsym(
++		pluginHandler, "UsecAcDbusGetRuleSize");
++    if (pluginHandler == NULL)
++	{
++		_dbus_verbose("load plugin so failed: dlsym UsecAcDbusGetRuleSize %s", dlerror());
++        close_usecac_function();
++		return FALSE;
++	}
++
++	UsecAcDbusGetRuleMemberSize = (uint16_t (*)(uint16_t))dlsym(
++		pluginHandler, "UsecAcDbusGetRuleMemberSize");
++    if (pluginHandler == NULL)
++	{
++		_dbus_verbose("load plugin so failed: dlsym UsecAcDbusGetRuleMemberSize %s", dlerror());
++        close_usecac_function();
++		return FALSE;
++	}
++
++    UsecAcDbusGetRule = (const char* (*)(uint16_t, uint16_t))dlsym(
++		pluginHandler, "UsecAcDbusGetRule");
++    if (pluginHandler == NULL)
++	{
++		_dbus_verbose("load plugin so failed: dlsym UsecAcDbusGetRule %s", dlerror());
++        close_usecac_function();
++		return FALSE;
++	}
++
++    UsecAcDBusCheckAuth = (int(*)(const UsecAcDBusMessage*, char** error_info))dlsym(
++		pluginHandler, "UsecAcDBusCheckAuth");
++    if (pluginHandler == NULL)
++	{
++		_dbus_verbose("load plugin so failed: dlsym UsecAcDBusCheckAuth %s", dlerror());
++        close_usecac_function();
++		return FALSE;
++	}
++
++    return TRUE;
++}
++
++dbus_bool_t deepin_usec_ac_init(BusContext *context)
++{
++    int rules_size;
++    uint16_t entity_id = 0;
++	uint16_t member_size = 0;
++	uint16_t member_id = 0;
++	dbus_bool_t r = TRUE;
++    const char* bus_type = bus_context_get_type(context);
++    int usec_ac_lib_major_version = 0;
++    int usec_ac_lib_minor_version = 0;
++    int usec_ac_lib_micro_version = 0;
++
++    _dbus_verbose("deepin_usec_ac_init\n");
++    if (context==NULL || bus_type==NULL || strlen(bus_type)==0) {
++        return TRUE;
++    }
++
++    if(!init_usecac_function()) {
++        _dbus_verbose("deepin_usec_ac_init init_usecac_function failed!");
++        return FALSE;
++    }
++
++    UsecAcGetLibVersion(&usec_ac_lib_major_version, &usec_ac_lib_minor_version, &usec_ac_lib_micro_version);
++    if (usec_ac_lib_major_version != USEC_AC_LIB_MAJOR_VERSION
++        || usec_ac_lib_minor_version != USEC_AC_LIB_MINOR_VERSION
++        || usec_ac_lib_micro_version != USEC_AC_LIB_MICRO_VERSION) {
++        _dbus_verbose("usec ac lib versin not 0.1.0!");
++        return FALSE;
++    }
++
++    UsecAcDbusInitCache(bus_type);
++
++    rules_size = UsecAcDbusGetRuleSize();
++    if (rules_size<1) {
++        _dbus_verbose("deepin_usec_ac_init no usec ac rules exist.");
++        return TRUE;
++    }
++
++    matchmaker = bus_matchmaker_new();
++    if (matchmaker == NULL)
++    {
++        _dbus_warn("matchmaker is nil, OOM");
++        return TRUE;
++    }
++
++    for (; entity_id<rules_size; ++entity_id) {
++		member_size = UsecAcDbusGetRuleMemberSize(entity_id);
++		if (member_size == 0) {
++			const char* rule = UsecAcDbusGetRule(entity_id, 0);
++			if (rule) {
++				r = deepin_usec_ac_register_rule(entity_id, 0, rule);
++				_dbus_verbose("deepin_usec_ac_register_rule rule = %s ret = %lu\n", rule, r);
++			}
++		}
++		else {
++			member_id = 0;
++			for(; member_id < member_size; ++member_id) {
++				const char* rule = UsecAcDbusGetRule(entity_id, member_id);
++				if (rule) {
++					r = deepin_usec_ac_register_rule(entity_id, member_id, rule);
++					_dbus_verbose("deepin_usec_ac_register_rule rule = %s ret = %lu\n", rule, r);
++				}
++			}
++		}
++    }
++
++    return r;
++}
++
++void deepin_usec_ac_shutdown(void)
++{
++	_dbus_verbose("deepin_usec_ac_shutdown\n");
++
++	if (matchmaker) {
++		bus_matchmaker_unref(matchmaker);
++		matchmaker = NULL;
++	}
++
++	close_usecac_function();
++}
++
++static void
++log_message (dbus_bool_t allow, const char *op, DBusString *data)
++{
++  const char *mstr;
++#ifdef HAVE_LIBAUDIT
++  int audit_fd;
++#endif
++
++  if (allow)
++    mstr = "ALLOWED";
++  else
++    mstr = "DENIED";
++
++#ifdef HAVE_LIBAUDIT
++  audit_fd = bus_audit_get_fd ();
++
++  if (audit_fd >= 0)
++  {
++    DBusString avc;
++
++    if (!_dbus_string_init (&avc))
++      goto syslog;
++
++    if (!_dbus_string_append_printf (&avc,
++          "usecac=\"%s\" operation=\"dbus_%s\" %s\n",
++          mstr, op, _dbus_string_get_const_data (data)))
++      {
++        _dbus_string_free (&avc);
++        goto syslog;
++      }
++
++    /* FIXME: need to change this to show real user */
++    audit_log_user_avc_message (audit_fd, AUDIT_USER_AVC,
++                                _dbus_string_get_const_data (&avc),
++                                NULL, NULL, NULL, getuid ());
++    _dbus_string_free (&avc);
++    return;
++  }
++
++syslog:
++#endif /* HAVE_LIBAUDIT */
++
++  syslog (LOG_USER | LOG_NOTICE, "usecac=\"%s\" operation=\"dbus_%s\" %s\n",
++          mstr, op, _dbus_string_get_const_data (data));
++}
++
++static dbus_bool_t
++_dbus_usec_append_pair_str (DBusString *auxdata, const char *name, const char *value)
++{
++  return _dbus_string_append (auxdata, " ") &&
++         _dbus_string_append (auxdata, name) &&
++         _dbus_string_append (auxdata, "=\"") &&
++         _dbus_string_append (auxdata, value) &&
++         _dbus_string_append (auxdata, "\"");
++}
++
++/**
++ * Check if usec ac security controls allow the message to be sent to a
++ * particular connection based on the security context of the sender and
++ * that of the receiver. The destination connection need not be the
++ * addressed recipient, it could be an "eavesdropper"
++ *
++ * @param sender the sender of the message.
++ * @param proposed_recipient the connection the message is to be sent to.
++ * @param requested_reply TRUE if the message is a reply requested by
++ *                        proposed_recipient
++ * @param bustype name of the bus
++ * @param msgtype message type (DBUS_MESSAGE_TYPE_METHOD_CALL, etc.)
++ * @param path object path the message should be sent to
++ * @param interface the type of the object instance
++ * @param member the member of the object
++ * @param error_name the name of the error if the message type is error
++ * @param destination name that the message should be sent to
++ * @param source name that the message should be sent from
++ * @param error the reason for failure when FALSE is returned
++ * @returns TRUE if the message is permitted
++ */
++dbus_bool_t deepin_usec_ac_allows_send(
++	BusContext *context,
++	DBusConnection *sender,
++	DBusConnection *proposed_recipient,
++	DBusConnection *addressed_recipient,
++	dbus_bool_t requested_reply,
++	const char *bustype,
++	DBusMessage *message,
++	int msgtype,
++	const char *path,
++	const char *interface,
++	const char *member,
++	const char *error_name,
++	const char *destination,
++	const char *source,
++	BusActivationEntry *activation_entry,
++	DBusError *error)
++{
++	dbus_bool_t result = TRUE;
++	BusConnections *connections = NULL;
++	DBusList *recipients = NULL;
++	DBusList *link;
++	UsecAcDBusMessage msg;
++	uint64_t rule_id;
++	unsigned long sender_pid = 0;
++	const char *arg_val = NULL;
++	DBusMessageIter iter;
++	int current_type = 0;
++	char* error_info = NULL;
++	DBusString auxdata;
++
++	// 当前只处理 proposed_recipient == addressed_recipient 这种比较普通的情况
++	if (matchmaker == NULL /*|| proposed_recipient != addressed_recipient*/)
++	{
++		return TRUE;
++	}
++
++	connections = bus_context_get_connections(context);
++	// TODO connections 可以为 NULL
++	bus_deepin_usec_ac_matchmaker_get_recipients(matchmaker, connections, sender, addressed_recipient, message, &recipients);
++	link = _dbus_list_get_first_link(&recipients);
++	if (link==NULL) {
++		_dbus_list_clear(&recipients);
++		return result;
++	}
++
++	memset(&msg, 0, sizeof(msg));
++	rule_id = (uint64_t)link->data;
++	dbus_connection_get_unix_process_id(sender, &sender_pid);
++	msg.rule_data.rule_id = (uint64_t)rule_id;
++	msg.sender = (char *)bus_connection_get_name(sender);
++	msg.sender_pid = (uint64_t)sender_pid;
++	msg.path = (char *)path;
++	msg.interface = (char *)interface;
++	msg.member = (char *)member;
++    msg.source = (char *)source;
++    msg.destination = (char *)destination;
++
++    if (strcmp(interface, "org.freedesktop.DBus.Properties") == 0)
++    {
++        if (strcmp(member, "Get") == 0 || strcmp(member, "Set") == 0)
++        {
++            dbus_message_iter_init(message, &iter);
++            dbus_message_iter_next(&iter); // 获取第二个参数, 即属性名称
++            current_type = dbus_message_iter_get_arg_type(&iter);
++            if (current_type == DBUS_TYPE_STRING)
++            {
++                dbus_message_iter_get_basic(&iter, &arg_val);
++                msg.arg1 = (char *)arg_val;
++            }
++        }
++    }
++
++	while (link != NULL)
++	{
++
++		result = UsecAcDBusCheckAuth(&msg, &error_info);
++		if (result == FALSE)
++		{
++            // TODO audit log
++            dbus_set_error (error, DBUS_ERROR_ACCESS_DENIED,
++                "deepin usec ac security deny this sender from sending this "
++                "message to this recipient; type=\"%s\", "
++                "sender=\"%s\" interface=\"%s\" member=\"%s\" "
++                "error name=\"%s\" requested_reply=\"%d\" "
++                "destination=\"%s\" usec_error=\"%s\"",
++                dbus_message_type_to_string(msgtype),
++                msg.sender,
++                interface ? interface : "(unset)",
++                member ? member : "(unset)",
++                error_name ? error_name : "(unset)",
++                requested_reply,
++                destination,
++                error_info? error_info : "(unset)");
++
++            if (_dbus_string_init (&auxdata)) {
++                if (_dbus_usec_append_pair_str (&auxdata, "bus", bustype ? bustype : "unknown")) {
++                    if (_dbus_usec_append_pair_str (&auxdata, "sender", msg.sender)) {
++                        if (_dbus_usec_append_pair_str (&auxdata, "interface", interface ? interface : "(unset)")) {
++                            if (_dbus_usec_append_pair_str (&auxdata, "member",  member ? member : "(unset)")) {
++                                if (_dbus_usec_append_pair_str (&auxdata, "destination",  destination)) {
++                                    if (_dbus_usec_append_pair_str (&auxdata, "error_info",  error_info? error_info : "(unset)")) {
++                                        log_message (FALSE, "send", &auxdata);
++                                    }
++                                }
++                            }
++                        }
++                    }
++                    _dbus_string_free (&auxdata);
++                }
++            }
++
++            if(error_info) {
++                free(error_info);
++            }
++			break;
++		}
++
++		link = _dbus_list_get_next_link(&recipients, link);
++	}
++
++	_dbus_list_clear(&recipients);
++
++	return result;
++}
++
++dbus_bool_t deepin_usec_ac_register_rule(uint16_t entity_id, uint16_t member_id,  const char *rule_text)
++{
++	DBusString rule_str;
++	DBusError error = DBUS_ERROR_INIT;
++	BusMatchRule *rule;
++	UsecAcRule data;
++
++	if (matchmaker == NULL)
++	{
++		_dbus_warn("matchmaker is nil, OOM");
++		return FALSE;
++	}
++
++	_dbus_verbose("deepin_usec_ac_register_rule rule_text: `%s`", rule_text);
++	_dbus_string_init(&rule_str);
++	_dbus_string_append(&rule_str, rule_text);
++
++	data.rule_id = 0;
++	data.entity.entity_id = entity_id;
++	data.entity.member_id = member_id;
++
++	rule = bus_match_rule_parse((DBusConnection *)(data.rule_id), &rule_str, &error);
++	if (dbus_error_is_set(&error))
++	{
++		// 处理错误？
++		_dbus_warn("deepin_usec_ac_register_rule error msg: %s", error.message);
++		dbus_error_free(&error);
++		return FALSE;
++	}
++
++	if (rule == NULL)
++	{
++		_dbus_warn("deepin_usec_ac_register_rule rule is null");
++		return FALSE;
++	}
++
++	return bus_usec_ac_matchmaker_add_rule(matchmaker, rule);
++}
+diff --git a/bus/deepin_usec_ac.h b/bus/deepin_usec_ac.h
+new file mode 100644
+index 0000000..cd52a97
+--- /dev/null
++++ b/bus/deepin_usec_ac.h
+@@ -0,0 +1,61 @@
++#ifndef BUS_DEEPIN_USEC_AC_H
++#define BUS_DEEPIN_USEC_AC_H
++
++#include <dbus/dbus.h>
++#include "bus.h"
++
++typedef struct {
++	uint16_t reserved[2];
++	uint16_t entity_id;
++	uint16_t member_id;
++} UsecAcEntity;
++
++typedef union {
++	uint64_t rule_id;
++	UsecAcEntity entity;
++} UsecAcRule;
++
++typedef struct
++{
++	UsecAcRule rule_data;
++	uint64_t sender_pid;
++
++	char *sender;
++	char *path;
++	char *interface;
++	char *member;
++	char *source;
++	char *destination;
++	char *arg1;
++	char *arg2;
++	char *arg3;
++	char *arg4;
++} UsecAcDBusMessage;
++
++dbus_bool_t deepin_usec_ac_reload(BusContext *context);
++
++dbus_bool_t deepin_usec_ac_init(BusContext *context);
++
++void deepin_usec_ac_shutdown(void);
++
++dbus_bool_t deepin_usec_ac_allows_send(
++	BusContext *context,
++	DBusConnection *sender,
++	DBusConnection *proposed_recipient,
++	DBusConnection * addressed_recipient,
++	dbus_bool_t requested_reply,
++	const char *bustype,
++	DBusMessage *message,
++	int msgtype,
++	const char *path,
++	const char *interface,
++	const char *member,
++	const char *error_name,
++	const char *destination,
++	const char *source,
++	BusActivationEntry *activation_entry,
++	DBusError *error);
++
++dbus_bool_t deepin_usec_ac_register_rule(uint16_t entity_id, uint16_t member_id, const char *rule_text);
++
++#endif
+diff --git a/bus/main.c b/bus/main.c
+index 5f756d5..2250f75 100644
+--- a/bus/main.c
++++ b/bus/main.c
+@@ -54,6 +54,9 @@ static BusContext *context;
+ 
+ #ifdef DBUS_UNIX
+ 
++// TODO ifdef
++#include "deepin_usec_ac.h"
++
+ /* Despite its name and its unidirectional nature, this is actually
+  * a socket pair. */
+ static DBusSocket reload_pipe[2];
+@@ -312,6 +315,8 @@ handle_reload_watch (DBusWatch    *watch,
+           _dbus_warn ("Unable to reload configuration: %s",
+                       error.message);
+           dbus_error_free (&error);
++        } else{
++            deepin_usec_ac_reload(context);
+         }
+       break;
+ 
+@@ -734,6 +739,10 @@ main (int argc, char **argv)
+    * print_pid_pipe
+    */
+ 
++  if (!deepin_usec_ac_init(context)) {
++        _dbus_verbose ("Deepin usec-ac pre-initialization failed!");
++  }
++
+ #ifdef DBUS_UNIX
+   setup_reload_pipe (bus_context_get_loop (context));
+ 
+@@ -753,6 +762,7 @@ main (int argc, char **argv)
+   bus_context_unref (context);
+   bus_selinux_shutdown ();
+   bus_apparmor_shutdown ();
++  deepin_usec_ac_shutdown();
+   bus_audit_shutdown ();
+ 
+   return 0;
+diff --git a/bus/signals.c b/bus/signals.c
+index d731487..9fcfa5f 100644
+--- a/bus/signals.c
++++ b/bus/signals.c
+@@ -1478,6 +1478,30 @@ bus_matchmaker_add_rule (BusMatchmaker   *matchmaker,
+   return TRUE;
+ }
+ 
++dbus_bool_t
++bus_usec_ac_matchmaker_add_rule(BusMatchmaker *matchmaker,
++                        BusMatchRule *rule)
++{
++  DBusList **rules;
++
++  _dbus_verbose("usec ac Adding rule with message_type %d, interface %s\n",
++                rule->message_type,
++                rule->interface != NULL ? rule->interface : "<null>");
++
++  rules = bus_matchmaker_get_rules(matchmaker, rule->message_type,
++                                   rule->interface, TRUE);
++
++  if (rules == NULL)
++    return FALSE;
++
++  if (!_dbus_list_append(rules, rule))
++    return FALSE;
++
++  bus_match_rule_ref(rule);
++
++  return TRUE;
++}
++
+ static dbus_bool_t
+ match_rule_equal (BusMatchRule *a,
+                   BusMatchRule *b)
+@@ -1608,6 +1632,30 @@ bus_matchmaker_remove_rule (BusMatchmaker   *matchmaker,
+   bus_match_rule_unref (rule);
+ }
+ 
++void bus_usec_ac_matchmaker_remove_rule(BusMatchmaker *matchmaker,
++                                BusMatchRule *rule)
++{
++  DBusList **rules;
++
++  _dbus_verbose("Removing rule with message_type %d, interface %s\n",
++                rule->message_type,
++                rule->interface != NULL ? rule->interface : "<null>");
++
++  rules = bus_matchmaker_get_rules(matchmaker, rule->message_type,
++                                   rule->interface, FALSE);
++
++  /* We should only be asked to remove a rule by identity right after it was
++   * added, so there should be a list for it.
++   */
++  _dbus_assert(rules != NULL);
++
++  _dbus_list_remove(rules, rule);
++  bus_matchmaker_gc_rules(matchmaker, rule->message_type, rule->interface,
++                          rules);
++
++  bus_match_rule_unref(rule);
++}
++
+ /*
+  * Prepare to remove the the most-recently-added rule which is equal to
+  * the given rule by value, but do not actually do it yet.
+@@ -2137,6 +2185,59 @@ get_recipients_from_list (DBusList       **rules,
+   return TRUE;
+ }
+ 
++static dbus_bool_t
++deepin_usec_ac_get_recipients_from_list(DBusList **rules,
++                         DBusConnection *sender,
++                         DBusConnection *addressed_recipient,
++                         DBusMessage *message,
++                         DBusList **recipients_p)
++{
++  DBusList *link;
++
++  if (rules == NULL)
++      return TRUE;
++
++  link = _dbus_list_get_first_link(rules);
++  while (link != NULL)
++  {
++      BusMatchRule *rule;
++
++      rule = link->data;
++
++#ifdef DBUS_ENABLE_VERBOSE_MODE
++      {
++            char *s = match_rule_to_string(rule);
++
++            _dbus_verbose("Checking whether message matches rule %s for connection %p\n",
++                          s ? s : "nomem", rule->matches_go_to);
++            dbus_free(s);
++      }
++#endif
++
++      if (match_rule_matches(rule,
++                             sender, addressed_recipient, message,
++                             BUS_MATCH_MESSAGE_TYPE | BUS_MATCH_INTERFACE))
++      {
++            _dbus_verbose("Rule matched\n");
++
++            /* Append to the list if we haven't already */
++            // if (bus_connection_mark_stamp(rule->matches_go_to))
++            // {
++              if (!_dbus_list_append(recipients_p, rule->matches_go_to))
++                return FALSE;
++            // }
++            // else
++            // {
++            //   _dbus_verbose("Connection already receiving this message, so not adding again\n");
++            // }
++      }
++
++      link = _dbus_list_get_next_link(rules, link);
++  }
++
++  return TRUE;
++}
++
+ dbus_bool_t
+ bus_matchmaker_get_recipients (BusMatchmaker   *matchmaker,
+                                BusConnections  *connections,
+@@ -2199,6 +2300,68 @@ bus_matchmaker_get_recipients (BusMatchmaker   *matchmaker,
+   return TRUE;
+ }
+ 
++dbus_bool_t
++bus_deepin_usec_ac_matchmaker_get_recipients(BusMatchmaker *matchmaker,
++                                       BusConnections *connections,
++                                       DBusConnection *sender,
++                                       DBusConnection *addressed_recipient,
++                                       DBusMessage *message,
++                                       DBusList **recipients_p)
++{
++  int type;
++  const char *interface;
++  DBusList **neither, **just_type, **just_iface, **both;
++
++  _dbus_assert(*recipients_p == NULL);
++
++  /* This avoids sending same message to the same connection twice.
++   * Purpose of the stamp instead of a bool is to avoid iterating over
++   * all connections resetting the bool each time.
++   */
++  // bus_connections_increment_stamp(connections);
++
++  /* addressed_recipient is already receiving the message, don't add to list.
++   * NULL addressed_recipient means either bus driver, or this is a signal
++   * and thus lacks a specific addressed_recipient.
++   */
++  if (addressed_recipient != NULL)
++      bus_connection_mark_stamp(addressed_recipient);
++
++  type = dbus_message_get_type(message);
++  interface = dbus_message_get_interface(message);
++
++  neither = bus_matchmaker_get_rules(matchmaker, DBUS_MESSAGE_TYPE_INVALID,
++                                     NULL, FALSE);
++  just_type = just_iface = both = NULL;
++
++  if (interface != NULL)
++      just_iface = bus_matchmaker_get_rules(matchmaker,
++                                            DBUS_MESSAGE_TYPE_INVALID, interface, FALSE);
++
++  if (type > DBUS_MESSAGE_TYPE_INVALID && type < DBUS_NUM_MESSAGE_TYPES)
++  {
++      just_type = bus_matchmaker_get_rules(matchmaker, type, NULL, FALSE);
++
++      if (interface != NULL)
++        both = bus_matchmaker_get_rules(matchmaker, type, interface, FALSE);
++  }
++
++  if (!(deepin_usec_ac_get_recipients_from_list(neither, sender, addressed_recipient,
++                                 message, recipients_p) &&
++        deepin_usec_ac_get_recipients_from_list(just_iface, sender, addressed_recipient,
++                                 message, recipients_p) &&
++        deepin_usec_ac_get_recipients_from_list(just_type, sender, addressed_recipient,
++                                 message, recipients_p) &&
++        deepin_usec_ac_get_recipients_from_list(both, sender, addressed_recipient,
++                                 message, recipients_p)))
++  {
++      _dbus_list_clear(recipients_p);
++      return FALSE;
++  }
++
++  return TRUE;
++}
++
+ #ifdef DBUS_ENABLE_EMBEDDED_TESTS
+ #include "test.h"
+ #include <stdlib.h>
+diff --git a/bus/signals.h b/bus/signals.h
+index 027e921..0ca1457 100644
+--- a/bus/signals.h
++++ b/bus/signals.h
+@@ -109,4 +109,26 @@ void      bus_matchmaker_commit_remove_rule_by_value  (BusMatchmaker   *matchmak
+                                                        BusMatchRule    *value,
+                                                        DBusList        *link);
+ 
++// deepin ext
++dbus_bool_t bus_deepin_usec_ac_match_rule_matches(BusMatchRule *rule,
++                                       DBusConnection *sender,
++                                       DBusConnection *addressed_recipient,
++                                       DBusMessage *message,
++                                       BusMatchFlags already_matched);
++
++dbus_bool_t
++bus_usec_ac_matchmaker_add_rule(BusMatchmaker *matchmaker,
++                                BusMatchRule *rule);
++
++void bus_usec_ac_matchmaker_remove_rule(BusMatchmaker *matchmaker,
++                                        BusMatchRule *rule);
++
++dbus_bool_t
++bus_deepin_usec_ac_matchmaker_get_recipients(BusMatchmaker *matchmaker,
++                                      BusConnections *connections,
++                                      DBusConnection *sender,
++                                      DBusConnection *addressed_recipient,
++                                      DBusMessage *message,
++                                      DBusList **recipients_p);
++// end deepin ext
+ #endif /* BUS_SIGNALS_H */
+-- 
+2.20.1
+

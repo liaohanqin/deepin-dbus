@@ -1,3 +1,10 @@
+dbus (1.14.10-3-1deepin1) unstable; urgency=medium
+
+  * feat: add deepin dbus control
+  *       添加D-Bus接口管控
+
+ -- zhangya <zhangya@uniontech.com>  Mon, 18 Sep 2024 18:12:35 +0000
+
 dbus (1.14.10-3) unstable; urgency=medium
 
   * d/control: dbus Depends on usr-is-merged (>= 38~).
